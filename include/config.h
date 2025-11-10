@@ -50,8 +50,8 @@
 
 // ==================== Sensor Configuration ====================
 // Enable/Disable sensors (comment out to disable)
-//#define ENABLE_SHT30
-//#define ENABLE_HC_SR04
+#define ENABLE_SHT30
+#define ENABLE_HC_SR04
 #define ENABLE_PH_SENSOR
 
 // Moving Average Window Sizes (optimized for 1-second reads, 15-second publishes)
@@ -119,6 +119,6 @@
 
 // ==================== LED Indicator (Optional) ====================
 #define LED_PIN 2  // Built-in LED on most ESP32 boards
-#define ENABLE_LED_INDICATOR
+//#define ENABLE_LED_INDICATOR
 
 #endif // CONFIG_H
