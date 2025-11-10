@@ -2,7 +2,6 @@
 #define PH_SENSOR_H
 
 #include "SensorBase.h"
-#include "MovingAverage.h"
 #include "config.h"
 
 /**
@@ -15,29 +14,55 @@
 class PHSensor : public SensorBase {
 private:
     uint8_t analogPin;
-    MovingAverage<float, PH_WINDOW> phAvg;
     float currentPH;
     
+    /**
+     * @brief Convert voltage to pH using Atlas Scientific piecewise linear calibration
+     * @param voltage_mV Voltage reading in millivolts
+     * @return pH value using 3-point calibration method
+     */
+    float readPHFromVoltage(float voltage_mV) {
+        // Atlas Scientific piecewise linear method
+        if (voltage_mV > PH_CAL_MID) { 
+            // High voltage = low pH (acidic range: pH 4-7)
+            // Uses low_cal and mid_cal calibration points
+            return 7.0 - 3.0 / (PH_CAL_LOW - PH_CAL_MID) * (voltage_mV - PH_CAL_MID);
+        } else {
+            // Low voltage = high pH (basic range: pH 7-10) 
+            // Uses mid_cal and high_cal calibration points
+            return 7.0 - 3.0 / (PH_CAL_MID - PH_CAL_HIGH) * (voltage_mV - PH_CAL_MID);
+        }
+    }
+
     /**
      * @brief Read raw ADC value and convert to pH
      * @return pH value (0-14 scale), or -1 on error
      */
     float readPH() {
-        // Read ADC value (12-bit: 0-4095)
-        int rawValue = analogRead(analogPin);
+        // Debug: Read raw ADC values first
+        int totalRawADC = 0;
+        float voltage_mV = 0;
         
-        // Convert to voltage (0-3.3V)
-        float voltage = (rawValue / ADC_RESOLUTION) * 3.3;
+        for (int i = 0; i < PH_VOLTAGE_AVERAGING; ++i) {
+            int rawADC = analogRead(analogPin);
+            totalRawADC += rawADC;
+            // ESP32 ADC with compensation (Atlas Scientific method)
+            voltage_mV += rawADC / 4095.0 * 3300.0 + ESP32_ADC_OFFSET_MV;
+        }
+        voltage_mV /= PH_VOLTAGE_AVERAGING;
+        int avgRawADC = totalRawADC / PH_VOLTAGE_AVERAGING;
         
-        // Convert voltage to pH using linear calibration
-        // Default: pH = (voltage / 3.3) * 14
-        float ph = ((voltage - PH_VOLTAGE_MIN) / (PH_VOLTAGE_MAX - PH_VOLTAGE_MIN)) * 14.0;
+        // Debug output for troubleshooting
+        Serial.printf("[pH] DEBUG: Pin %d, Raw ADC: %d, Voltage: %.1fmV\n", 
+                      analogPin, avgRawADC, voltage_mV);
         
-        // Apply calibration adjustments
-        ph = (ph * PH_CALIBRATION_SLOPE) + PH_CALIBRATION_OFFSET;
+        // Convert voltage to pH using Atlas Scientific piecewise linear calibration
+        float ph = readPHFromVoltage(voltage_mV);
         
         #ifdef DEBUG_VERBOSE
-        Serial.printf("[pH] ADC: %d, Voltage: %.3fV, pH: %.2f\n", rawValue, voltage, ph);
+        Serial.printf("[pH] Voltage: %.1fmV, pH: %.2f, Range: %s\n", 
+                      voltage_mV, ph, 
+                      (voltage_mV > PH_CAL_MID) ? "Acidic(4-7)" : "Basic(7-10)");
         #endif
         
         return ph;
@@ -48,7 +73,7 @@ public:
      * @brief Constructor
      * @param pin Analog input pin number
      */
-    PHSensor(uint8_t pin) : SensorBase("pH"), analogPin(pin), currentPH(7.0) {}
+    PHSensor(uint8_t pin) : SensorBase("pH", true), analogPin(pin), currentPH(7.0) {}
     
     /**
      * @brief Initialize the pH sensor
@@ -60,12 +85,29 @@ public:
         // Configure ADC
         pinMode(analogPin, INPUT);
         
-        // ESP32 ADC configuration
+        // ESP32 ADC configuration - detailed setup
+        Serial.printf("[pH] Configuring ADC on pin %d (ADC1_CH6)\n", analogPin);
+        
         // Set ADC attenuation to 11dB for full 0-3.3V range
         analogSetAttenuation(ADC_11db);
         
-        // Take a test reading
+        // Additional ESP32 ADC setup
+        analogSetWidth(12);  // 12-bit resolution (0-4095)
+        
+        // Test raw ADC reading first
         delay(100);
+        int rawTest = analogRead(analogPin);
+        Serial.printf("[pH] Raw ADC test reading: %d (should be 0-4095)\n", rawTest);
+        
+        if (rawTest == 0) {
+            Serial.println("[pH] WARNING: ADC reading 0 - check wiring and sensor connection!");
+            Serial.println("[pH] Troubleshooting:");
+            Serial.println("[pH] 1. Verify sensor is connected to pin 34");
+            Serial.println("[pH] 2. Check sensor power supply (3.3V or 5V)");
+            Serial.println("[pH] 3. Verify sensor output is within 0-3.3V range");
+            Serial.println("[pH] 4. Test with multimeter on pin 34");
+        }
+        
         float testPH = readPH();
         
         if (testPH < 0 || testPH > 14) {
@@ -88,6 +130,7 @@ public:
     bool read() override {
         if (!initialized) {
             Serial.println("[pH] ERROR: Sensor not initialized");
+            addFailureToAverage();  // Record failure in moving average
             lastReadSuccess = false;
             return false;
         }
@@ -97,18 +140,20 @@ public:
         // Validate range
         if (ph < PH_MIN || ph > PH_MAX) {
             Serial.printf("[pH] ERROR: pH out of range: %.2f\n", ph);
+            addFailureToAverage();  // Record failure in moving average
             lastReadSuccess = false;
             return false;
         }
         
         // Add to moving average
-        phAvg.add(ph);
+        addToAverage(ph);
         
         // Update current value with averaged reading
-        currentPH = phAvg.getAverage();
+        currentPH = getAverage(ph);
         
         #ifdef DEBUG_VERBOSE
-        Serial.printf("[pH] Raw: %.2f | Avg: %.2f\n", ph, currentPH);
+        Serial.printf("[pH] Raw: %.2f | Avg: %.2f | Success: %.1f%% (%zu valid)\n", 
+                      ph, currentPH, getSuccessRate(), getValidReadingCount());
         #endif
         
         lastReadSuccess = true;

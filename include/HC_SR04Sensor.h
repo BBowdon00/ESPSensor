@@ -2,28 +2,29 @@
 #define HC_SR04_SENSOR_H
 
 #include "SensorBase.h"
-#include "MovingAverage.h"
 #include "config.h"
 
 /**
- * @brief HC-SR04 Ultrasonic Distance Sensor
+ * @brief HC-SR04 Ultrasonic Water Level Sensor
  * 
- * Measures distance using ultrasonic time-of-flight.
- * Used for water level monitoring in hydroponic systems.
+ * Measures water level using ultrasonic distance sensor mounted on container lid.
+ * Sensor points down into container, measures distance to water surface.
+ * Converts distance to actual water level: water_level = container_height - distance
+ * Used for water level monitoring in hydroponic reservoir systems.
  * Applies moving average filtering to reduce noise.
  */
 class HC_SR04Sensor : public SensorBase {
 private:
     uint8_t trigPin;
     uint8_t echoPin;
-    MovingAverage<float, WATER_LEVEL_WINDOW> distanceAvg;
-    float currentDistance;
+    float currentWaterLevel;
+    float lastRawDistance;
     
     /**
-     * @brief Measure distance using ultrasonic sensor
+     * @brief Measure raw distance using ultrasonic sensor
      * @return Distance in millimeters, or -1 on error
      */
-    float measureDistance() {
+    float measureRawDistance() {
         // Send 10us pulse to trigger
         digitalWrite(trigPin, LOW);
         delayMicroseconds(2);
@@ -47,6 +48,25 @@ private:
         return distance;
     }
     
+    /**
+     * @brief Convert raw distance to water level
+     * @param distanceMm Raw distance measurement in millimeters
+     * @return Water level in centimeters, or -1 on error
+     */
+    float convertToWaterLevel(float distanceMm) {
+        if (distanceMm < 0) {
+            return -1.0;  // Error propagation
+        }
+        
+        // Convert distance from mm to cm
+        float distanceCm = distanceMm / 10.0;
+        
+        // Calculate water level: container_height - distance_to_water
+        float waterLevelCm = CONTAINER_HEIGHT_CM - distanceCm;
+        
+        return waterLevelCm;
+    }
+    
 public:
     /**
      * @brief Constructor
@@ -54,7 +74,7 @@ public:
      * @param echo Echo pin number
      */
     HC_SR04Sensor(uint8_t trig, uint8_t echo) 
-        : SensorBase("HC-SR04"), trigPin(trig), echoPin(echo), currentDistance(0.0) {}
+        : SensorBase("HC-SR04", true), trigPin(trig), echoPin(echo), currentWaterLevel(0.0), lastRawDistance(0.0) {}
     
     /**
      * @brief Initialize the HC-SR04 sensor
@@ -70,12 +90,14 @@ public:
         
         // Test reading
         delay(100);
-        float testReading = measureDistance();
+        float testDistance = measureRawDistance();
         
-        if (testReading < 0) {
+        if (testDistance < 0) {
             Serial.println("[HC-SR04] WARNING: Initial test reading failed, but sensor initialized");
         } else {
-            Serial.printf("[HC-SR04] Test reading: %.2f mm\n", testReading);
+            float testWaterLevel = convertToWaterLevel(testDistance);
+            Serial.printf("[HC-SR04] Test reading - Distance: %.1f mm, Water Level: %.1f cm\n", 
+                         testDistance, testWaterLevel);
         }
         
         Serial.println("[HC-SR04] Sensor initialized successfully");
@@ -90,34 +112,50 @@ public:
     bool read() override {
         if (!initialized) {
             Serial.println("[HC-SR04] ERROR: Sensor not initialized");
-            lastReadSuccess = false;
+            markFailedRead();
             return false;
         }
         
-        float distance = measureDistance();
+        // Measure raw distance
+        float rawDistance = measureRawDistance();
+        lastRawDistance = rawDistance;
         
-        // Check for error
-        if (distance < 0) {
+        // Check for sensor error
+        if (rawDistance < 0) {
             Serial.println("[HC-SR04] ERROR: Timeout or invalid reading");
+            addFailureToAverage();  // Record failure in moving average
             lastReadSuccess = false;
             return false;
         }
         
-        // Validate range
-        if (distance < WATER_LEVEL_MIN || distance > WATER_LEVEL_MAX) {
-            Serial.printf("[HC-SR04] ERROR: Distance out of range: %.2f mm\n", distance);
+        // Convert to water level
+        float waterLevel = convertToWaterLevel(rawDistance);
+        
+        // Validate water level range - only add valid readings to moving average
+        if (waterLevel < MIN_WATER_LEVEL_CM || waterLevel > MAX_WATER_LEVEL_CM) {
+            Serial.printf("[HC-SR04] WARNING: Water level out of range: %.1f cm (distance: %.1f mm) - NOT added to average\n", 
+                         waterLevel, rawDistance);
+            
+            // Check if this might be a raised lid condition
+            if (waterLevel < MIN_WATER_LEVEL_CM) {
+                Serial.println("[HC-SR04] Possible raised lid or empty container detected");
+            }
+            
+            addFailureToAverage();  // Record failure in moving average
             lastReadSuccess = false;
-            return false;
+            return false;  // Don't contaminate moving average with bad readings
         }
         
-        // Add to moving average
-        distanceAvg.add(distance);
+        // Only add valid readings to moving average
+        addToAverage(waterLevel);
         
         // Update current value with averaged reading
-        currentDistance = distanceAvg.getAverage();
+        currentWaterLevel = getAverage(waterLevel);
         
         #ifdef DEBUG_VERBOSE
-        Serial.printf("[HC-SR04] Raw: %.2f mm | Avg: %.2f mm\n", distance, currentDistance);
+        Serial.printf("[HC-SR04] Raw: %.1fmm -> WaterLevel: %.1fcm | Avg: %.1fcm | Success: %.1f%% (%zu valid)\n", 
+                      rawDistance, waterLevel, currentWaterLevel, 
+                      getSuccessRate(), getValidReadingCount());
         #endif
         
         lastReadSuccess = true;
@@ -125,20 +163,33 @@ public:
     }
     
     /**
-     * @brief Get averaged distance value
-     * @return Distance in millimeters
+     * @brief Get averaged water level value
+     * @return Water level in centimeters
      */
-    float getDistance() const {
-        return currentDistance;
+    float getWaterLevel() const {
+        return currentWaterLevel;
     }
     
     /**
-     * @brief Get distance as formatted string
+     * @brief Get water level as formatted string
      * @param buffer Character buffer to store result
      * @param bufSize Size of buffer
      */
-    void getDistanceString(char* buffer, size_t bufSize) const {
-        snprintf(buffer, bufSize, "%.2f", currentDistance);
+    void getWaterLevelString(char* buffer, size_t bufSize) const {
+        snprintf(buffer, bufSize, "%.1f", currentWaterLevel);
+    }
+    
+    /**
+     * @brief Get last raw distance measurement (for debugging)
+     * @return Raw distance in millimeters
+     */
+    float getLastRawDistance() const {
+        return lastRawDistance;
+    }
+    
+    // Legacy method for compatibility with existing code
+    float getDistance() const {
+        return getWaterLevel();
     }
 };
 

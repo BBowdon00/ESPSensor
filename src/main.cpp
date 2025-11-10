@@ -39,6 +39,7 @@ PHSensor phSensor(PH_SENSOR_PIN);
 
 // ==================== Timing Variables ====================
 unsigned long lastSensorRead = 0;
+unsigned long lastSensorPublish = 0;
 unsigned long lastHealthMsg = 0;
 unsigned long lastWiFiAttempt = 0;
 unsigned long lastMQTTAttempt = 0;
@@ -107,6 +108,9 @@ void setup() {
 }
 
 // ==================== Main Loop ====================
+unsigned long lastStatusLog = 0;
+#define STATUS_LOG_INTERVAL 300000  // Log status every 5 minutes
+
 void loop() {
     // Reset watchdog timer
     esp_task_wdt_reset();
@@ -131,17 +135,50 @@ void loop() {
     updateLEDIndicator();
     #endif
     
-    // Read sensors at regular intervals
     unsigned long currentMillis = millis();
+    
+    // Periodic status logging (every 5 minutes)
+    if (currentMillis - lastStatusLog >= STATUS_LOG_INTERVAL) {
+        lastStatusLog = currentMillis;
+        Serial.println("\n╔════════════════════════════════════════╗");
+        Serial.println("║     PERIODIC STATUS REPORT             ║");
+        Serial.println("╚════════════════════════════════════════╝");
+        Serial.printf("[STATUS] Uptime: %lu seconds (%.2f hours)\n", 
+                      currentMillis / 1000, (currentMillis / 1000) / 3600.0);
+        Serial.printf("[STATUS] WiFi: %s (RSSI: %d dBm)\n", 
+                      WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected",
+                      WiFi.RSSI());
+        Serial.printf("[STATUS] MQTT: %s\n", 
+                      mqttClient.connected() ? "Connected" : "Disconnected");
+        Serial.printf("[STATUS] Free Heap: %d bytes (%.2f KB)\n", 
+                      ESP.getFreeHeap(), ESP.getFreeHeap() / 1024.0);
+        Serial.println("════════════════════════════════════════\n");
+    }
+    
+    // Read sensors at regular intervals (for moving average data collection)
     if (currentMillis - lastSensorRead >= SENSOR_READ_INTERVAL) {
         lastSensorRead = currentMillis;
+        Serial.printf("\n[LOOP] Next sensor read at: %lu ms (in %lu seconds)\n", 
+                      currentMillis + SENSOR_READ_INTERVAL, 
+                      SENSOR_READ_INTERVAL / 1000);
         readSensors();
+    }
+    
+    // Publish sensor data at regular intervals
+    if (currentMillis - lastSensorPublish >= SENSOR_PUBLISH_INTERVAL) {
+        lastSensorPublish = currentMillis;
+        Serial.printf("\n[LOOP] Next sensor publish at: %lu ms (in %lu seconds)\n", 
+                      currentMillis + SENSOR_PUBLISH_INTERVAL, 
+                      SENSOR_PUBLISH_INTERVAL / 1000);
         publishSensorData();
     }
     
     // Publish health message at regular intervals
     if (currentMillis - lastHealthMsg >= HEALTH_MSG_INTERVAL) {
         lastHealthMsg = currentMillis;
+        Serial.printf("\n[LOOP] Next health message at: %lu ms (in %lu seconds)\n", 
+                      currentMillis + HEALTH_MSG_INTERVAL, 
+                      HEALTH_MSG_INTERVAL / 1000);
         publishHealthMessage();
     }
     
@@ -189,9 +226,27 @@ void reconnectWiFi() {
     lastWiFiAttempt = currentMillis;
     
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("[WiFi] Reconnecting...");
+        Serial.println("\n[WiFi] ⚠ Connection lost - attempting reconnection...");
+        Serial.printf("[WiFi] Last successful connection: %lu ms ago\n", 
+                      currentMillis - lastWiFiAttempt + WIFI_RECONNECT_INTERVAL);
         WiFi.disconnect();
         WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        
+        // Wait briefly for connection
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+            delay(500);
+            Serial.print(".");
+            attempts++;
+        }
+        
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("\n[WiFi] ✓ Reconnected successfully!");
+            Serial.printf("[WiFi] IP Address: %s\n", WiFi.localIP().toString().c_str());
+            Serial.printf("[WiFi] Signal Strength: %d dBm\n", WiFi.RSSI());
+        } else {
+            Serial.println("\n[WiFi] ✗ Reconnection failed, will retry");
+        }
     }
 }
 
@@ -313,119 +368,229 @@ void initializeSensors() {
 }
 
 void readSensors() {
-    Serial.println("\n[SENSORS] Reading all sensors...");
+    #ifdef DEBUG_VERBOSE
+    Serial.printf("\n[SENSORS] Reading sensors for moving average (uptime: %lu s)\n", millis() / 1000);
+    #endif
+    
+    int successCount = 0;
+    int failCount = 0;
     
     #ifdef ENABLE_SHT30
     if (sht30Sensor.isInitialized()) {
         if (sht30Sensor.read()) {
-            Serial.printf("[SENSORS] Temperature: %.2f°C, Humidity: %.2f%%\n", 
+            #ifdef DEBUG_VERBOSE
+            Serial.printf("[SHT30] ✓ T:%.1f°C H:%.1f%%\n", 
                          sht30Sensor.getTemperature(), sht30Sensor.getHumidity());
+            #endif
+            successCount += 2;
+        } else {
+            Serial.println("[SHT30] ✗ Read failed");
+            failCount += 2;
         }
+    } else {
+        failCount += 2;
     }
     #endif
     
     #ifdef ENABLE_HC_SR04
     if (waterLevelSensor.isInitialized()) {
         if (waterLevelSensor.read()) {
-            Serial.printf("[SENSORS] Water Level: %.2f mm\n", waterLevelSensor.getDistance());
+            #ifdef DEBUG_VERBOSE
+            Serial.printf("[HC-SR04] ✓ %.1fcm\n", waterLevelSensor.getWaterLevel());
+            #endif
+            successCount++;
+        } else {
+            Serial.println("[HC-SR04] ✗ Read failed");
+            failCount++;
         }
+    } else {
+        failCount++;
     }
     #endif
     
     #ifdef ENABLE_PH_SENSOR
     if (phSensor.isInitialized()) {
         if (phSensor.read()) {
-            Serial.printf("[SENSORS] pH: %.2f\n", phSensor.getPH());
+            #ifdef DEBUG_VERBOSE
+            Serial.printf("[pH] ✓ %.2f\n", phSensor.getPH());
+            #endif
+            successCount++;
+        } else {
+            Serial.println("[pH] ✗ Read failed");
+            failCount++;
         }
+    } else {
+        failCount++;
+    }
+    #endif
+    
+    #ifdef DEBUG_VERBOSE
+    if (failCount > 0) {
+        Serial.printf("[SENSORS] Summary: %d ok, %d failed\n", successCount, failCount);
     }
     #endif
 }
 
 void publishSensorData() {
     if (!mqttClient.connected()) {
-        Serial.println("[MQTT] Not connected, skipping sensor publish");
+        Serial.println("\n[MQTT] ✗ Not connected, skipping sensor publish");
         return;
     }
     
-    Serial.println("\n[MQTT] Publishing sensor data...");
+    Serial.println("\n========================================");
+    Serial.println("[MQTT] === Publishing Sensor Data ===");
+    Serial.printf("[MQTT] Topic: %s\n", MQTT_TOPIC_SENSOR);
+    Serial.println("========================================");
     
-    // Publish each sensor individually following the message format
+    int publishCount = 0;
+    int failCount = 0;
+    
+    // Publish each sensor individually following the Hydroponic Monitor message format
     #ifdef ENABLE_SHT30
-    if (sht30Sensor.isInitialized() && sht30Sensor.isLastReadSuccess()) {
-        StaticJsonDocument<200> doc;
-        doc["type"] = "temperature";
-        doc["value"] = String(sht30Sensor.getTemperature(), 2);
-        doc["unit"] = "°C";
-        
-        char buffer[200];
-        serializeJson(doc, buffer);
-        
-        if (mqttClient.publish(MQTT_TOPIC_SENSOR, buffer, false)) {
-            Serial.println("[MQTT] ✓ Temperature published");
+    if (sht30Sensor.isInitialized()) {
+        // Publish temperature if majority of readings are valid
+        if (sht30Sensor.hasValidTemperatureMajority()) {
+            StaticJsonDocument<300> doc;
+            doc["deviceType"] = "temperature";
+            doc["deviceID"] = "1";
+            doc["location"] = DEVICE_LOCATION;
+            doc["value"] = String(sht30Sensor.getTemperature(), 2);
+            doc["description"] = String(DEVICE_DESCRIPTION_PREFIX) + " - temperature";
+            
+            char buffer[300];
+            serializeJson(doc, buffer);
+            
+            #ifdef DEBUG_VERBOSE
+            Serial.printf("[MQTT] Temperature payload: %s\n", buffer);
+            #endif
+            
+            if (mqttClient.publish(MQTT_TOPIC_SENSOR, buffer, false)) {
+                Serial.printf("[MQTT] ✓ Temperature published: %.2f°C (%.1f%% success rate)\n", 
+                             sht30Sensor.getTemperature(), sht30Sensor.getTemperatureSuccessRate());
+                publishCount++;
+            } else {
+                Serial.println("[MQTT] ✗ Failed to publish temperature");
+                failCount++;
+            }
         } else {
-            Serial.println("[MQTT] ✗ Failed to publish temperature");
+            Serial.printf("[MQTT] ⊘ Skipping temperature (success rate: %.1f%%, need >50%%)\n", 
+                         sht30Sensor.getTemperatureSuccessRate());
         }
         
-        // Publish humidity
-        doc.clear();
-        doc["type"] = "humidity";
-        doc["value"] = String(sht30Sensor.getHumidity(), 2);
-        doc["unit"] = "%";
-        
-        serializeJson(doc, buffer);
-        
-        if (mqttClient.publish(MQTT_TOPIC_SENSOR, buffer, false)) {
-            Serial.println("[MQTT] ✓ Humidity published");
+        // Publish humidity if majority of readings are valid
+        if (sht30Sensor.hasValidHumidityMajority()) {
+            StaticJsonDocument<300> doc;
+            doc["deviceType"] = "humidity";
+            doc["deviceID"] = "1";
+            doc["location"] = DEVICE_LOCATION;
+            doc["value"] = String(sht30Sensor.getHumidity(), 2);
+            doc["description"] = String(DEVICE_DESCRIPTION_PREFIX) + " - humidity";
+            
+            char buffer[300];
+            serializeJson(doc, buffer);
+            
+            #ifdef DEBUG_VERBOSE
+            Serial.printf("[MQTT] Humidity payload: %s\n", buffer);
+            #endif
+            
+            if (mqttClient.publish(MQTT_TOPIC_SENSOR, buffer, false)) {
+                Serial.printf("[MQTT] ✓ Humidity published: %.2f%% (%.1f%% success rate)\n", 
+                             sht30Sensor.getHumidity(), sht30Sensor.getHumiditySuccessRate());
+                publishCount++;
+            } else {
+                Serial.println("[MQTT] ✗ Failed to publish humidity");
+                failCount++;
+            }
         } else {
-            Serial.println("[MQTT] ✗ Failed to publish humidity");
+            Serial.printf("[MQTT] ⊘ Skipping humidity (success rate: %.1f%%, need >50%%)\n", 
+                         sht30Sensor.getHumiditySuccessRate());
         }
+    } else {
+        Serial.println("[MQTT] ⊘ Skipping temperature/humidity (sensor not initialized)");
     }
     #endif
     
     #ifdef ENABLE_HC_SR04
-    if (waterLevelSensor.isInitialized() && waterLevelSensor.isLastReadSuccess()) {
-        StaticJsonDocument<200> doc;
-        doc["type"] = "waterLevel";
-        doc["value"] = String(waterLevelSensor.getDistance(), 2);
-        doc["unit"] = "mm";
+    if (waterLevelSensor.isInitialized() && waterLevelSensor.hasValidMajority()) {
+        StaticJsonDocument<300> doc;
+        doc["deviceType"] = "waterLevel";
+        doc["deviceID"] = "1";
+        doc["location"] = DEVICE_LOCATION;
+        doc["value"] = String(waterLevelSensor.getWaterLevel(), 1);
+        doc["description"] = String(DEVICE_DESCRIPTION_PREFIX) + " - water level";
         
-        char buffer[200];
+        char buffer[300];
         serializeJson(doc, buffer);
         
+        #ifdef DEBUG_VERBOSE
+        Serial.printf("[MQTT] Water level payload: %s\n", buffer);
+        #endif
+        
         if (mqttClient.publish(MQTT_TOPIC_SENSOR, buffer, false)) {
-            Serial.println("[MQTT] ✓ Water level published");
+            Serial.printf("[MQTT] ✓ Water level published: %.1f cm\n", waterLevelSensor.getWaterLevel());
+            publishCount++;
         } else {
             Serial.println("[MQTT] ✗ Failed to publish water level");
+            failCount++;
+        }
+    } else {
+        if (waterLevelSensor.isInitialized()) {
+            Serial.printf("[MQTT] ⊘ Skipping water level (success rate: %.1f%%, need >50%%) - lid may be raised\n", 
+                         waterLevelSensor.getSuccessRate());
+        } else {
+            Serial.println("[MQTT] ⊘ Skipping water level (sensor not ready)");
         }
     }
     #endif
     
     #ifdef ENABLE_PH_SENSOR
-    if (phSensor.isInitialized() && phSensor.isLastReadSuccess()) {
-        StaticJsonDocument<200> doc;
-        doc["type"] = "pH";
+    if (phSensor.isInitialized() && phSensor.hasValidMajority()) {
+        StaticJsonDocument<300> doc;
+        doc["deviceType"] = "pH";
+        doc["deviceID"] = "1";
+        doc["location"] = DEVICE_LOCATION;
         doc["value"] = String(phSensor.getPH(), 2);
-        doc["unit"] = "";
+        doc["description"] = String(DEVICE_DESCRIPTION_PREFIX) + " - pH sensor";
         
-        char buffer[200];
+        char buffer[300];
         serializeJson(doc, buffer);
         
+        #ifdef DEBUG_VERBOSE
+        Serial.printf("[MQTT] pH payload: %s\n", buffer);
+        #endif
+        
         if (mqttClient.publish(MQTT_TOPIC_SENSOR, buffer, false)) {
-            Serial.println("[MQTT] ✓ pH published");
+            Serial.printf("[MQTT] ✓ pH published: %.2f\n", phSensor.getPH());
+            publishCount++;
         } else {
             Serial.println("[MQTT] ✗ Failed to publish pH");
+            failCount++;
+        }
+    } else {
+        if (phSensor.isInitialized()) {
+            Serial.printf("[MQTT] ⊘ Skipping pH (success rate: %.1f%%, need >50%%)\n", 
+                         phSensor.getSuccessRate());
+        } else {
+            Serial.println("[MQTT] ⊘ Skipping pH (sensor not ready)");
         }
     }
     #endif
+    
+    Serial.println("========================================");
+    Serial.printf("[MQTT] Publish Summary: %d successful, %d failed\n", publishCount, failCount);
+    Serial.println("========================================\n");
 }
 
 void publishHealthMessage() {
     if (!mqttClient.connected()) {
-        Serial.println("[MQTT] Not connected, skipping health publish");
+        Serial.println("\n[MQTT] ✗ Not connected, skipping health publish");
         return;
     }
     
-    Serial.println("\n[MQTT] Publishing health message...");
+    Serial.println("\n========================================");
+    Serial.println("[MQTT] === Publishing Health Message ===");
+    Serial.printf("[MQTT] Topic: %s\n", MQTT_TOPIC_HEALTH);
+    Serial.println("========================================");
     
     StaticJsonDocument<512> doc;
     doc["deviceId"] = MQTT_CLIENT_ID;
@@ -454,12 +619,27 @@ void publishHealthMessage() {
     char buffer[512];
     serializeJson(doc, buffer);
     
+    // Print health details
+    Serial.printf("[HEALTH] Device ID: %s\n", MQTT_CLIENT_ID);
+    Serial.printf("[HEALTH] Uptime: %lu seconds (%.2f hours)\n", 
+                  millis() / 1000, (millis() / 1000) / 3600.0);
+    Serial.printf("[HEALTH] Firmware: %s\n", FIRMWARE_VERSION);
+    Serial.printf("[HEALTH] Free Heap: %d bytes (%.2f KB)\n", 
+                  ESP.getFreeHeap(), ESP.getFreeHeap() / 1024.0);
+    Serial.printf("[HEALTH] WiFi RSSI: %d dBm\n", WiFi.RSSI());
+    
+    #ifdef DEBUG_VERBOSE
+    Serial.printf("[HEALTH] JSON payload: %s\n", buffer);
+    #endif
+    
     // Use QoS 1 for health messages
     if (mqttClient.publish(MQTT_TOPIC_HEALTH, buffer, true)) {
-        Serial.println("[MQTT] ✓ Health message published");
+        Serial.println("[MQTT] ✓ Health message published successfully");
     } else {
         Serial.println("[MQTT] ✗ Failed to publish health message");
     }
+    
+    Serial.println("========================================\n");
 }
 
 // ==================== LED Indicator Function ====================

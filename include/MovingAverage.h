@@ -12,33 +12,61 @@ template <typename T, size_t SIZE>
 class MovingAverage {
 private:
     T buffer[SIZE];
+    bool validBuffer[SIZE];  // Track which entries are valid vs failed reads
     size_t index;
     size_t count;
     T sum;
+    size_t validCount;  // Count of valid readings in the window
     
 public:
-    MovingAverage() : index(0), count(0), sum(0) {
+    MovingAverage() : index(0), count(0), sum(0), validCount(0) {
         for (size_t i = 0; i < SIZE; i++) {
             buffer[i] = 0;
+            validBuffer[i] = false;
         }
     }
     
     /**
-     * @brief Add a new value to the moving average
+     * @brief Add a new successful value to the moving average
      * @param value New value to add
      */
     void add(T value) {
-        // Subtract the oldest value from sum
-        sum -= buffer[index];
+        addReading(value, true);
+    }
+    
+    /**
+     * @brief Record a failed reading (no value, just track the failure)
+     */
+    void addFailure() {
+        addReading(T(0), false);  // Use default value, mark as invalid
+    }
+    
+    /**
+     * @brief Add a reading (success or failure) to the moving average
+     * @param value Value to add (ignored if failed)
+     * @param isValid Whether this reading is valid
+     */
+    void addReading(T value, bool isValid) {
+        // Remove the oldest entry from sum and valid count
+        if (validBuffer[index]) {
+            sum -= buffer[index];
+            validCount--;
+        }
         
-        // Add new value to buffer and sum
-        buffer[index] = value;
-        sum += value;
+        // Add new entry to buffer
+        buffer[index] = isValid ? value : T(0);
+        validBuffer[index] = isValid;
+        
+        // Update sum and valid count if this is a valid reading
+        if (isValid) {
+            sum += value;
+            validCount++;
+        }
         
         // Update index (circular buffer)
         index = (index + 1) % SIZE;
         
-        // Track how many values we've received
+        // Track how many values we've received (valid or invalid)
         if (count < SIZE) {
             count++;
         }
@@ -46,13 +74,13 @@ public:
     
     /**
      * @brief Get the current moving average
-     * @return Average of values in the buffer
+     * @return Average of values in the buffer (only valid readings)
      */
     T getAverage() const {
-        if (count == 0) {
+        if (validCount == 0) {
             return 0;
         }
-        return sum / count;
+        return sum / validCount;
     }
     
     /**
@@ -70,17 +98,45 @@ public:
         index = 0;
         count = 0;
         sum = 0;
+        validCount = 0;
         for (size_t i = 0; i < SIZE; i++) {
             buffer[i] = 0;
+            validBuffer[i] = false;
         }
     }
     
     /**
-     * @brief Get the number of samples currently in the buffer
-     * @return Number of samples
+     * @brief Get the number of samples currently in the buffer (valid + invalid)
+     * @return Total number of samples
      */
     size_t getCount() const {
         return count;
+    }
+    
+    /**
+     * @brief Get the number of valid samples in the buffer
+     * @return Number of valid samples
+     */
+    size_t getValidCount() const {
+        return validCount;
+    }
+    
+    /**
+     * @brief Check if more than half the readings in the window are valid
+     * @return true if > 50% of readings are valid, false otherwise
+     */
+    bool hasValidMajority() const {
+        if (count == 0) return false;
+        return validCount > (count / 2);
+    }
+    
+    /**
+     * @brief Get the success rate as a percentage
+     * @return Success rate (0.0 to 100.0)
+     */
+    float getSuccessRate() const {
+        if (count == 0) return 0.0f;
+        return (float(validCount) / float(count)) * 100.0f;
     }
 };
 
